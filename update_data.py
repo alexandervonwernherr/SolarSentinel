@@ -1,196 +1,95 @@
-import time
+import requests
+from pathlib import Path
+from datetime import date
 
 import numpy as np
 import pandas as pd
-import pyspedas
+from pathlib import Path
+from datetime import date
 
-try:
-    from tqdm import tqdm
-except ImportError:  # progress bar is optional
-    tqdm = None
+BASE = "https://spdf.gsfc.nasa.gov/pub/data/omni"
+OUT = Path("omni_raw"); OUT.mkdir(exist_ok=True)
 
-KP_EVENTS_FILE = "kp_events.csv"
+def fetch(url, dest):
+    if dest.exists() and dest.stat().st_size > 0:
+        print("skip", dest.name); return
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with requests.get(url, stream=True, timeout=60) as r:
+        if r.status_code == 404:
+            print("not found", url); return
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+    tmp.rename(dest)
+    print("ok  ", dest.name, f"{dest.stat().st_size/1e6:.0f} MB")
 
-# Inclusive range: 01.01.1970 .. 27.06.2019 (whole days)
-START = pd.Timestamp("1970-01-01")
-END = pd.Timestamp("2019-06-27")
+# 1) Hourly OMNI2 (contains Kp, Dst, F10.7, sunspot number)
+fetch(f"{BASE}/low_res_omni/omni2_all_years.dat", OUT / "omni2_all_years.dat")
 
-# DSCOVR launched 2015-02-11; earlier days can only be NaN stubs, so skip the download.
-DSCOVR_FIRST_DAY = pd.Timestamp("2015-02-11")
+# 2) 1-minute OMNI, one file per year
+for year in range(1981, date.today().year + 1):
+    fetch(f"{BASE}/high_res_omni/omni_min{year}.asc", OUT / f"omni_min{year}.asc")
 
-# Without tqdm: print a status line every N days
-FALLBACK_PRINT_EVERY = 50
+    RAW = Path("omni_raw")
+OUT = Path("omni_all.csv")
+TMP = OUT.with_suffix(".csv.part")
 
+def make_time(df):
+    return (pd.to_datetime(df["year"].astype(str), format="%Y")
+            + pd.to_timedelta(df["doy"] - 1, unit="D")
+            + pd.to_timedelta(df["hour"], unit="h")
+            + pd.to_timedelta(df.get("minute", 0), unit="m"))
 
-def log(msg):
-    """Print without breaking the tqdm progress bar."""
-    if tqdm is not None:
-        tqdm.write(msg)
-    else:
-        print(msg)
+def clean(df, fills):
+    for col, fill in fills.items():
+        df[col] = df[col].where(~np.isclose(df[col], fill))   # fill value -> NaN
+    return df
 
+# ---------- hourly OMNI2: Kp, Dst, F10.7, sunspot number, ap ----------
+hcols = {0: "year", 1: "doy", 2: "hour", 38: "kp10", 39: "sunspot",
+         40: "dst", 49: "ap", 50: "f107"}
+h = pd.read_csv(RAW / "omni2_all_years.dat", sep=r"\s+", header=None,
+                usecols=list(hcols)).rename(columns=hcols)
+h = clean(h, {"kp10": 99, "sunspot": 999, "dst": 99999, "ap": 999, "f107": 999.9})
+h["kp"] = h["kp10"] / 10.0                      # stored as Kp*10 (27 = 2+)
+h["time"] = make_time(h)
+h = (h[["time", "kp", "sunspot", "dst", "ap", "f107"]]
+     .drop_duplicates("time").sort_values("time"))
 
-def fmt_duration(seconds):
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+# ---------- 1-minute OMNI ----------
+mcols = {0: "year", 1: "doy", 2: "hour", 3: "minute", 9: "timeshift_s",
+         13: "b_mag", 14: "bx_gsm", 17: "by_gsm", 18: "bz_gsm",
+         21: "speed", 25: "density", 26: "temp", 27: "pressure",
+         28: "e_field", 37: "ae", 38: "al", 39: "au",
+         41: "sym_h", 43: "asy_h", 44: "pc_n"}
+mfills = {"timeshift_s": 999999, "b_mag": 9999.99, "bx_gsm": 9999.99,
+          "by_gsm": 9999.99, "bz_gsm": 9999.99, "speed": 99999.9,
+          "density": 999.99, "temp": 9999999., "pressure": 99.99,
+          "e_field": 999.99, "ae": 99999, "al": 99999, "au": 99999,
+          "sym_h": 99999, "asy_h": 99999, "pc_n": 999.99}
 
+total, first = 0, True
+for year in range(1981, date.today().year + 1):
+    f = RAW / f"omni_min{year}.asc"
+    if not f.exists():
+        print("missing", f.name); continue
 
-def main():
-    print("Updating NOAA Kp index, OMNI and DSCOVR data files...")
-    noaa_update()
+    df = pd.read_csv(f, sep=r"\s+", header=None, usecols=list(mcols)).rename(columns=mcols)
+    df = clean(df, mfills)
+    df["time"] = make_time(df)
+    df = df.drop(columns=["year", "doy", "hour", "minute"])
+    df = df.drop_duplicates("time").sort_values("time")
 
+    df = pd.merge_asof(df, h, on="time", direction="backward",
+                       tolerance=pd.Timedelta("1h"))
 
-def tplot_to_frame(names):
-    """Convert pyspedas tplot variable names into one time-indexed DataFrame (or None)."""
-    parts = []
-    for name in names or []:
-        d = pyspedas.get_data(name)
-        if d is None:
-            continue
-        idx = pd.to_datetime(d.times, unit="s")
-        y = np.asarray(d.y)
-        if y.ndim == 1:
-            part = pd.Series(y, index=idx, name=name)
-        else:
-            y2 = y.reshape(len(y), -1)
-            suffixes = ["x", "y", "z"] if y2.shape[1] == 3 else range(y2.shape[1])
-            part = pd.DataFrame(y2, index=idx, columns=[f"{name}_{s}" for s in suffixes])
-        part = part[~part.index.duplicated(keep="first")]
-        parts.append(part)
-    if not parts:
-        return None
-    return pd.concat(parts, axis=1)
+    df = df[["time"] + [c for c in df.columns if c != "time"]]
+    df.to_csv(TMP, mode="w" if first else "a", header=first, index=False,
+              float_format="%.5g", date_format="%Y-%m-%d %H:%M")
+    first = False
+    total += len(df)
+    print(year, f"{len(df):,} rows")
 
-
-def safe_load(label, day, loader, **kwargs):
-    """Run a pyspedas loader for one day. Returns a DataFrame, or None if unavailable."""
-    try:
-        names = loader(**kwargs)
-        return tplot_to_frame(names)
-    except Exception as e:
-        log(f"  {label}: no data for {day.date()} ({e})")
-        return None
-    finally:
-        try:
-            pyspedas.del_data("*")  # avoid stale variables leaking into the next day
-        except Exception:
-            pass
-
-
-def nan_stub(day):
-    """One all-NaN row at the start of the day; becomes NaN in every column after concat."""
-    return pd.DataFrame(index=pd.DatetimeIndex([day]))
-
-
-def has_data(df):
-    return df is not None and not df.empty
-
-
-def noaa_update():
-    """
-    Read the list of Kp events, take every distinct day between 1970-01-01 and
-    2019-06-27 (inclusive) exactly once, and download Kp, OMNI and DSCOVR data
-    for each day. Missing datasets are stubbed with NaN. Results are saved to
-    kp_data.csv, omni_data.csv and dscovr_data.csv.
-    """
-    kp_events = pd.read_csv(KP_EVENTS_FILE)
-    dates = pd.to_datetime(kp_events["date_utc"], errors="coerce", utc=True)
-    n_total_events = len(dates)
-    n_bad = int(dates.isna().sum())
-    dates = dates.dropna()
-
-    # Reduce to calendar days (tz-naive UTC), filter the range, one entry per day.
-    days = dates.dt.tz_convert("UTC").dt.tz_localize(None).dt.normalize()
-    n_in_range = int(((days >= START) & (days <= END)).sum())
-    days = days[(days >= START) & (days <= END)].drop_duplicates().sort_values()
-    total = len(days)
-
-    print(f"Read {n_total_events} events ({n_bad} unparseable dates dropped).")
-    print(f"{n_in_range} events in {START.date()}..{END.date()} -> {total} unique days to process.")
-    if total == 0:
-        print("Nothing to do.")
-        return
-
-    kp_frames, omni_frames, dscovr_frames = [], [], []
-    got = {"Kp": 0, "OMNI": 0, "DSCOVR": 0}  # days with real (non-stub) data
-
-    t0 = time.time()
-    iterator = tqdm(days, total=total, unit="day", desc="Downloading") if tqdm else days
-
-    for i, day in enumerate(iterator, start=1):
-        day_str = day.strftime("%Y-%m-%d")
-        trange = [f"{day_str}/00:00:00", f"{day_str}/23:59:59"]
-        if tqdm is not None:
-            iterator.set_description(f"Downloading {day_str}")
-
-        # --- Kp -------------------------------------------------------------
-        kp = safe_load("Kp", day, pyspedas.projects.noaa.noaa_load_kp,
-                       trange=trange, time_clip=True)
-        if has_data(kp):
-            got["Kp"] += 1
-            kp_frames.append(kp)
-        else:
-            kp_frames.append(nan_stub(day))
-
-        # --- OMNI -----------------------------------------------------------
-        omni = safe_load("OMNI", day, pyspedas.projects.omni.data,
-                         trange=trange, datatype="1min", time_clip=True)
-        if has_data(omni):
-            got["OMNI"] += 1
-            omni_frames.append(omni)
-        else:
-            omni_frames.append(nan_stub(day))
-
-        # --- DSCOVR (mag + faraday cup) --------------------------------------
-        parts = []
-        if day >= DSCOVR_FIRST_DAY:
-            for label, loader in (("DSCOVR mag", pyspedas.projects.dscovr.mag),
-                                  ("DSCOVR fc", pyspedas.projects.dscovr.fc)):
-                df = safe_load(label, day, loader, trange=trange, time_clip=True)
-                if has_data(df):
-                    parts.append(df)
-        if parts:
-            got["DSCOVR"] += 1
-            dscovr_frames.append(pd.concat(parts, axis=1).resample("1min").mean())
-        else:
-            dscovr_frames.append(nan_stub(day))
-
-        # --- progress ---------------------------------------------------------
-        if tqdm is not None:
-            iterator.set_postfix(Kp=got["Kp"], OMNI=got["OMNI"], DSCOVR=got["DSCOVR"])
-        elif i % FALLBACK_PRINT_EVERY == 0 or i == total:
-            elapsed = time.time() - t0
-            eta = elapsed / i * (total - i)
-            print(f"[{i}/{total}] {100 * i / total:5.1f}%  {day_str}  "
-                  f"data days: Kp={got['Kp']} OMNI={got['OMNI']} DSCOVR={got['DSCOVR']}  "
-                  f"elapsed {fmt_duration(elapsed)}, ETA {fmt_duration(eta)}")
-
-    if tqdm is not None:
-        iterator.close()
-
-    print("\nSaving files...")
-    save("kp_data.csv", kp_frames)
-    save("omni_data.csv", omni_frames)
-    save("dscovr_data.csv", dscovr_frames)
-
-    print("\n=== Summary ===")
-    print(f"Days processed: {total}   Total time: {fmt_duration(time.time() - t0)}")
-    for name in ("Kp", "OMNI", "DSCOVR"):
-        n = got[name]
-        print(f"  {name:<7} real data: {n:>6} days   NaN-stubbed: {total - n:>6} days")
-
-
-def save(path, frames):
-    if not frames:
-        print(f"  No data to save for {path}")
-        return
-    out = pd.concat(frames)
-    out.index.name = "time_utc"
-    out.to_csv(path)
-    print(f"  Saved {path}: {out.shape[0]} rows, {out.shape[1]} columns")
-
-
-if __name__ == "__main__":
-    main()
+TMP.replace(OUT)
+print(f"done: {total:,} rows -> {OUT} ({OUT.stat().st_size/1e9:.1f} GB)")
