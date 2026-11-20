@@ -1,10 +1,10 @@
-"""Wandelt die OMNI-Rohdaten pro Jahr in _data/<jahr>/ in eine Parquet-Datei um.
+"""Converts the raw OMNI files per year in _data/<year>/ into one Parquet file.
 
-Gleiche Spalten und Bereinigung wie update_data.py, gleiches Parquet-Format wie Alex
-in SolarSentinel.ipynb (Index = time, float32, zstd, leere Zukunftszeilen abgeschnitten).
+Same columns and cleaning as update_data.py, same Parquet format as Alex
+in SolarSentinel.ipynb (index = time, float32, zstd, empty future rows cut off).
 
-Aufruf aus dem Repo-Root:  uv run python Karl/omni_jahr_zu_parquet.py 1989 2003 2022 2024
-Ergebnis:                  _data/<jahr>/omni_<jahr>.parquet
+Run from the repo root:  uv run python Karl/tools/omni_year_to_parquet.py 1989 2003 2022 2024
+Result:                  _data/<year>/omni_<year>.parquet
 """
 import sys
 from pathlib import Path
@@ -14,8 +14,8 @@ import pandas as pd
 
 DATA = Path("_data")
 
-# shortcut: Spalten + Füllwerte aus update_data.py kopiert (das Skript lädt beim Import sofort herunter);
-#           wenn update_data.py Funktionen bekommt, von dort importieren.
+# shortcut: columns + fill values copied from update_data.py (that script downloads on import);
+#           import them from there once update_data.py has functions.
 HCOLS = {0: "year", 1: "doy", 2: "hour", 38: "kp10", 39: "sunspot",
          40: "dst", 49: "ap", 50: "f107"}
 HFILLS = {"kp10": 99, "sunspot": 999, "dst": 99999, "ap": 999, "f107": 999.9}
@@ -40,7 +40,7 @@ def make_time(df):
 
 def clean(df, fills):
     for col, fill in fills.items():
-        df[col] = df[col].where(~np.isclose(df[col], fill))  # Füllwert -> NaN
+        df[col] = df[col].where(~np.isclose(df[col], fill))  # fill value -> NaN
     return df
 
 
@@ -54,7 +54,7 @@ def read(path, cols, fills):
 def convert(year):
     folder = DATA / str(year)
     h = read(folder / f"omni2_{year}.dat", HCOLS, HFILLS)
-    h["kp"] = h["kp10"] / 10.0  # gespeichert als Kp*10 (27 = 2+)
+    h["kp"] = h["kp10"] / 10.0  # stored as Kp*10 (27 = 2+)
     h = h[["time", "kp", "sunspot", "dst", "ap", "f107"]]
 
     m = read(folder / f"omni_min{year}.asc", MCOLS, MFILLS)
@@ -62,7 +62,7 @@ def convert(year):
 
     df = pd.merge_asof(m, h, on="time", direction="backward", tolerance=pd.Timedelta("1h"))
     df = df.set_index("time")
-    df = df.loc[:df["bz_gsm"].last_valid_index()]  # wie Alex: leere Zukunftszeilen weg
+    df = df.loc[:df["bz_gsm"].last_valid_index()]  # like Alex: drop empty future rows
     df = df.astype("float32")
 
     assert df.index.is_monotonic_increasing and not df.index.duplicated().any()
