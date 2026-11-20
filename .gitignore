@@ -218,3 +218,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# SolarSentinel: Daten und Modelle nicht ins Repo (aus project_template)
+omni_raw/
+omni_all.csv*
+*.parquet
+_data/*
+!_data/.gitkeep
+_models/*
+!_models/.gitkeep
+mlruns
+.mlflow_uri
